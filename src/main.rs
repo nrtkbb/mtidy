@@ -11,18 +11,18 @@ use walkdir::WalkDir;
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: {} <input_folder> <output_folder> [copy_flag]", args[0]);
+        eprintln!("Usage: {} <input_folder> <output_folder> [move]", args[0]);
         std::process::exit(1);
     }
 
     let input_folder = &args[1];
     let output_folder = &args[2];
-    let copy_flag = if args.len() == 4 { &args[3] == "copy" } else { true };
+    let move_flag = if args.len() == 4 && &args[3] == "move" { true } else { false };
 
-    process_files(input_folder, output_folder, copy_flag);
+    process_files(input_folder, output_folder, move_flag);
 }
 
-fn process_files(input_folder: &str, output_folder: &str, copy_flag: bool) {
+fn process_files(input_folder: &str, output_folder: &str, move_flag: bool) {
     for entry in WalkDir::new(input_folder) {
         let entry = entry.unwrap();
         if entry.file_type().is_file() {
@@ -37,7 +37,7 @@ fn process_files(input_folder: &str, output_folder: &str, copy_flag: bool) {
                         fs::create_dir_all(&new_folder_path).unwrap();
                     }
 
-                    process_folder_files(parent_folder, &new_folder_path, copy_flag);
+                    process_folder_files(parent_folder, &new_folder_path, move_flag);
                 }
             }
         }
@@ -63,7 +63,9 @@ fn create_new_folder_path(output_folder: &str, timestamp: u64) -> PathBuf {
         .join(new_folder_name)
 }
 
-fn process_folder_files(parent_folder: &Path, new_folder_path: &Path, copy_flag: bool) {
+fn process_folder_files(parent_folder: &Path, new_folder_path: &Path, move_flag: bool) {
+    let mut copied_or_moved = false;
+    let mut skipped = false;
     for entry in fs::read_dir(parent_folder).unwrap() {
         let entry = entry.unwrap();
         let src_path = entry.path();
@@ -75,19 +77,40 @@ fn process_folder_files(parent_folder: &Path, new_folder_path: &Path, copy_flag:
 
             if src_metadata.len() > dest_metadata.len() {
                 fs::copy(&src_path, &dest_path).unwrap();
+                copied_or_moved = true;
             } else if src_metadata.len() == dest_metadata.len() {
                 let src_modified = src_metadata.modified().unwrap();
                 let dest_modified = dest_metadata.modified().unwrap();
                 if src_modified > dest_modified {
                     fs::copy(&src_path, &dest_path).unwrap();
+                    copied_or_moved = true;
+                } else {
+                    skipped = true;
                 }
+            } else {
+                skipped = true;
             }
         } else {
-            if copy_flag {
-                fs::copy(&src_path, &dest_path).unwrap();
-            } else {
+            if move_flag {
                 fs::rename(&src_path, &dest_path).unwrap();
+            } else {
+                fs::copy(&src_path, &dest_path).unwrap();
             }
+            copied_or_moved = true;
         }
+    }
+    if copied_or_moved {
+        println!(
+            "{} {} to {}",
+            if move_flag { "Moved" } else { "Copied" },
+            parent_folder.display(),
+            new_folder_path.display()
+        );
+    } else if skipped {
+        println!(
+            "Skipped {} to {}",
+            parent_folder.display(),
+            new_folder_path.display()
+        );
     }
 }
