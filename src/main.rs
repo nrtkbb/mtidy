@@ -60,6 +60,7 @@ fn create_new_folder_path(output_folder: &str, timestamp: u64) -> PathBuf {
     PathBuf::from(output_folder)
         .join(datetime.format("%Y").to_string())
         .join(datetime.format("%m").to_string())
+        .join(datetime.format("%d").to_string()) 
         .join(new_folder_name)
 }
 
