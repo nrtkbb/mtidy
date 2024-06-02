@@ -86,6 +86,15 @@ fn process_folder_files(parent_folder: &Path, new_folder_path: &Path, move_flag:
                     eprintln!("Error removing file {}: {}", src_path.display(), e);
                 }
             }
+            
+            // Check if the parent folder is empty
+            if parent_folder.read_dir().map(|mut i| i.next().is_none()).unwrap_or(false) {
+                if let Err(e) = fs::remove_dir(parent_folder) {
+                    eprintln!("Error removing empty folder {}: {}", parent_folder.display(), e);
+                } else {
+                    println!("Removed empty folder {}", parent_folder.display());
+                }
+            }
         }
         println!(
             "{} {} to {}",
