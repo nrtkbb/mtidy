@@ -1,11 +1,14 @@
 use std::env;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use chrono::prelude::*;
+use filetime::{FileTime, set_file_times};
+
 use chrono::offset::TimeZone;
 use chrono::LocalResult;
+use chrono::Local;
 use walkdir::WalkDir;
 
 fn main() {
@@ -52,7 +55,7 @@ fn get_timestamp(path: &Path) -> u64 {
 }
 
 fn create_new_folder_path(output_folder: &str, timestamp: u64) -> PathBuf {
-    let datetime: DateTime<Utc> = match Utc.timestamp_opt(timestamp as i64, 0) {
+    let datetime = match Local.timestamp_opt(timestamp as i64, 0) {
         LocalResult::Single(dt) => dt,
         _ => panic!("Invalid timestamp"),
     };
@@ -65,53 +68,149 @@ fn create_new_folder_path(output_folder: &str, timestamp: u64) -> PathBuf {
 }
 
 fn process_folder_files(parent_folder: &Path, new_folder_path: &Path, move_flag: bool) {
-    let mut copied_or_moved = false;
-    let mut skipped = false;
-    for entry in fs::read_dir(parent_folder).unwrap() {
-        let entry = entry.unwrap();
-        let src_path = entry.path();
-        let dest_path = new_folder_path.join(src_path.file_name().unwrap());
-
-        if dest_path.exists() {
-            let src_metadata = src_path.metadata().unwrap();
-            let dest_metadata = dest_path.metadata().unwrap();
-
-            if src_metadata.len() > dest_metadata.len() {
-                fs::copy(&src_path, &dest_path).unwrap();
-                copied_or_moved = true;
-            } else if src_metadata.len() == dest_metadata.len() {
-                let src_modified = src_metadata.modified().unwrap();
-                let dest_modified = dest_metadata.modified().unwrap();
-                if src_modified > dest_modified {
-                    fs::copy(&src_path, &dest_path).unwrap();
-                    copied_or_moved = true;
-                } else {
-                    skipped = true;
+    let copied_files = match copy_files(parent_folder, new_folder_path) {
+        Ok(copied_files) => copied_files,
+        Err(_) => return, 
+    };
+    
+    // Check if all files are copied correctly
+    let all_copied = check_all_files(&copied_files);
+    
+    if all_copied {
+        if move_flag {
+            for (src_path, _, copied) in copied_files {
+                if !copied {
+                    continue;
                 }
-            } else {
-                skipped = true;
+                if let Err(e) = fs::remove_file(&src_path) {
+                    eprintln!("Error removing file {}: {}", src_path.display(), e);
+                }
             }
-        } else {
-            if move_flag {
-                fs::rename(&src_path, &dest_path).unwrap();
-            } else {
-                fs::copy(&src_path, &dest_path).unwrap();
-            }
-            copied_or_moved = true;
         }
-    }
-    if copied_or_moved {
         println!(
             "{} {} to {}",
             if move_flag { "Moved" } else { "Copied" },
             parent_folder.display(),
             new_folder_path.display()
         );
-    } else if skipped {
+    } else {
         println!(
-            "Skipped {} to {}",
+            "Skipped {} to {} due to copy errors",
             parent_folder.display(),
             new_folder_path.display()
         );
     }
+}
+
+fn get_file_timestamps(file_path: &Path) -> io::Result<(FileTime, FileTime)> {
+    let metadata = match fs::metadata(file_path) {
+        Ok(metadata) => metadata,
+        Err(e) => return Err(io::Error::new(io::ErrorKind::Other, format!("Failed to get metadata for file {}: {}", file_path.display(), e))),
+    };
+
+    let modified = FileTime::from_last_modification_time(&metadata);
+
+    let created = match FileTime::from_creation_time(&metadata) {
+        Some(created_time) => created_time,
+        None => return Err(io::Error::new(io::ErrorKind::Other, format!("Creation time not available for file {}", file_path.display()))),
+    };
+
+    Ok((created, modified))
+}
+
+fn copy_file(src_path: &Path, dest_path: &Path) -> io::Result<()> {
+    let (src_created, src_modified) = get_file_timestamps(&src_path)?;
+
+    fs::copy(&src_path, &dest_path)?;
+
+    set_file_times(&dest_path, src_created, src_modified)
+        .map_err(|e| {
+            match e.kind() {
+                std::io::ErrorKind::PermissionDenied => {
+                    io::Error::new(io::ErrorKind::PermissionDenied, format!("Failed to set creation time for {}: {}", dest_path.display(), e))
+                },
+                _ => {
+                    io::Error::new(io::ErrorKind::Other, format!("Failed to set modification time for {}: {}", dest_path.display(), e))
+                },
+            }
+        })?;
+
+    Ok(())
+}
+
+fn copy_files(parent_folder: &Path, new_folder_path: &Path) -> io::Result<Vec<(PathBuf, PathBuf, bool)>> {
+    let mut copied_files = Vec::new();
+    for entry in fs::read_dir(parent_folder)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dest_path = new_folder_path.join(src_path.file_name().unwrap());
+
+        let copied = if dest_path.exists() {
+            let (_, src_modified) = match get_file_timestamps(&src_path) {
+                Ok(timestamps) => timestamps,
+                Err(e) => {
+                    eprintln!("Failed to get timestamps for source file {}: {}", src_path.display(), e);
+                    continue;
+                },
+            };
+
+            let (_, dest_modified) = match get_file_timestamps(&dest_path) {
+                Ok(timestamps) => timestamps,
+                Err(e) => {
+                    eprintln!("Failed to get timestamps for destination file {}: {}", dest_path.display(), e);
+                    continue;
+                },
+            };
+
+            if src_modified > dest_modified {
+                match copy_file(&src_path, &dest_path) {
+                    Ok(()) => {
+                        println!("{} - Copied file from {} to {}", Local::now().format("%Y-%m-%d %H:%M:%S"), src_path.display(), dest_path.display());
+                        true
+                    },
+                    Err(e) => {
+                        eprintln!("Error copying file {} to {}: {}", src_path.display(), dest_path.display(), e);
+                        false
+                    },
+                }
+            } else {
+                false
+            }
+        } else {
+            match copy_file(&src_path, &dest_path) {
+                Ok(()) => {
+                    println!("{} - Copied file from {} to {}", Local::now().format("%Y-%m-%d %H:%M:%S"), src_path.display(), dest_path.display());
+                    true
+                },
+                Err(e) => {
+                    eprintln!("Error copying file {} to {}: {}", src_path.display(), dest_path.display(), e);
+                    false
+                },
+            }
+        };
+
+        copied_files.push((src_path, dest_path, copied));
+    }
+    Ok(copied_files)
+}
+
+
+fn check_all_files(copied_files: &Vec<(PathBuf, PathBuf, bool)>) -> bool {
+    for (src_path, dest_path, _copied) in copied_files {
+        if let Ok(src_metadata) = src_path.metadata() {
+            if let Ok(dest_metadata) = dest_path.metadata() {
+                if src_metadata.len() != dest_metadata.len() {
+                    eprintln!("File size mismatch for {} and {}", src_path.display(), dest_path.display());
+                    return false;
+                }
+            } else {
+                eprintln!("Failed to get metadata for {}", dest_path.display());
+                return false;
+            }
+        } else {
+            eprintln!("Failed to get metadata for {}", src_path.display());
+            return false;
+        }
+    }
+    true
 }
