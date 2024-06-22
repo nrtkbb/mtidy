@@ -1,117 +1,152 @@
-use std::env;
 use std::fs;
+use std::fmt;
+use std::env;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
-
-use chrono::prelude::*;
-use chrono::offset::TimeZone;
-use chrono::LocalResult;
+use std::process::Command;
+use fs_extra::dir::get_size;
+use chrono::prelude::{DateTime, Local};
+use thiserror::Error;
 use walkdir::WalkDir;
+
+type Result<T> = std::result::Result<T, CustomError>;
+
+#[derive(Debug, Error)]
+enum CustomError {
+    #[error("walkdir error")]
+    WalkDirError,
+}
+
+#[derive(Debug)]
+struct MovieFolder {
+    path: PathBuf,
+    size: u64,
+    m_time: DateTime<Local>,
+}
+
+impl fmt::Display for MovieFolder {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{} {} {}", self.path.display(), self.size, self.m_time)
+    }
+}
+
+fn get_movie_folders(input_path: &Path) -> Result<Vec<MovieFolder>> {
+    let mut movie_folders = vec![];
+    for entry in WalkDir::new(input_path) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_e) => {
+                return Err(CustomError::WalkDirError);
+           }
+        };
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        let entry_extension = match entry.path().extension() {
+            Some(e) => e,
+            None => {
+                continue;
+            }
+        };
+        if entry_extension == "wav" || entry_extension == "WAV" {
+            let entry_path = entry.path();
+            let movie_path = if let Some(movie_path) = entry_path.parent() {
+                movie_path
+            } else {
+                panic!("Not found parent path for {}", entry_path.display());
+            };
+            let movie_size = if let Ok(movie_size) = get_size(&movie_path) {
+                movie_size
+            } else {
+                panic!("fs_extra::dir::get_size for {}", movie_path.display());
+            };
+            let entry_meta = if let Ok(entry_meta) = fs::metadata(&entry.path()) {
+                entry_meta
+            } else {
+                panic!("Get metadata for {}", entry_path.display());
+            };
+            let entry_mtime = if let Ok(entry_mtime) = entry_meta.modified() {
+                entry_mtime
+            } else {
+                panic!("Get modified time for {}", entry_path.display());
+            };
+            let movie_folder = MovieFolder {
+                path: movie_path.to_path_buf(),
+                size: movie_size,
+                m_time: entry_mtime.into(),
+
+            };
+            movie_folders.push(movie_folder);
+        }
+    }
+    Ok(movie_folders)
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: {} <input_folder> <output_folder> [move]", args[0]);
-        std::process::exit(1);
+    if args.len() != 3 {
+        println!("使用法: {} <入力ファイルパス> <出力ファイルパス>", args[0]);
+        return;
     }
 
-    let input_folder = &args[1];
-    let output_folder = &args[2];
-    let move_flag = if args.len() == 4 && &args[3] == "move" { true } else { false };
+    let input_path = Path::new(&args[1]);
+    let output_path = Path::new(&args[2]);
 
-    process_files(input_folder, output_folder, move_flag);
-}
-
-fn process_files(input_folder: &str, output_folder: &str, move_flag: bool) {
-    for entry in WalkDir::new(input_folder) {
-        let entry = entry.unwrap();
-        if entry.file_type().is_file() {
-            let path = entry.path();
-            if let Some(ext) = path.extension() {
-                if ext == "WAV" || ext == "wav" {
-                    let parent_folder = path.parent().unwrap();
-                    let timestamp = get_timestamp(path);
-                    let new_folder_path = create_new_folder_path(output_folder, timestamp);
-
-                    if !new_folder_path.exists() {
-                        fs::create_dir_all(&new_folder_path).unwrap();
-                    }
-
-                    process_folder_files(parent_folder, &new_folder_path, move_flag);
-                }
-            }
-        }
+    if !input_path.exists() {
+        println!("入力ファイルパスが存在しません。");
+        return;
     }
-}
 
-fn get_timestamp(path: &Path) -> u64 {
-    match path.metadata().unwrap().modified() {
-        Ok(time) => time.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-        Err(_) => 0,
-    }
-}
-
-fn create_new_folder_path(output_folder: &str, timestamp: u64) -> PathBuf {
-    let datetime: DateTime<Utc> = match Utc.timestamp_opt(timestamp as i64, 0) {
-        LocalResult::Single(dt) => dt,
-        _ => panic!("Invalid timestamp"),
+    let movie_folders = match get_movie_folders(input_path) {
+        Ok(m) => m,
+        Err(e) => panic!("{:?}", e),
     };
-    let new_folder_name = format!("{}", datetime.format("%Y%m%d_%H%M%S"));
-    PathBuf::from(output_folder)
-        .join(datetime.format("%Y").to_string())
-        .join(datetime.format("%m").to_string())
-        .join(datetime.format("%d").to_string()) 
-        .join(new_folder_name)
-}
-
-fn process_folder_files(parent_folder: &Path, new_folder_path: &Path, move_flag: bool) {
-    let mut copied_or_moved = false;
-    let mut skipped = false;
-    for entry in fs::read_dir(parent_folder).unwrap() {
-        let entry = entry.unwrap();
-        let src_path = entry.path();
-        let dest_path = new_folder_path.join(src_path.file_name().unwrap());
-
-        if dest_path.exists() {
-            let src_metadata = src_path.metadata().unwrap();
-            let dest_metadata = dest_path.metadata().unwrap();
-
-            if src_metadata.len() > dest_metadata.len() {
-                fs::copy(&src_path, &dest_path).unwrap();
-                copied_or_moved = true;
-            } else if src_metadata.len() == dest_metadata.len() {
-                let src_modified = src_metadata.modified().unwrap();
-                let dest_modified = dest_metadata.modified().unwrap();
-                if src_modified > dest_modified {
-                    fs::copy(&src_path, &dest_path).unwrap();
-                    copied_or_moved = true;
-                } else {
-                    skipped = true;
-                }
-            } else {
-                skipped = true;
+    for movie_folder in movie_folders {
+        let mk_dir = output_path.join(format!(
+            "{}/{}/{}",
+            movie_folder.m_time.format("%Y"),
+            movie_folder.m_time.format("%m"),
+            movie_folder.m_time.format("%d")
+        ));
+        if !mk_dir.exists() {
+            let mk_status = Command::new("mkdir")
+                .arg("-p")
+                .arg(&mk_dir)
+                .status()
+                .expect("mkdirコマンドの実行に失敗しました。");
+            if !mk_status.success() {
+                panic!("mkdirコマンドの実行に失敗したため終了します");
             }
-        } else {
-            if move_flag {
-                fs::rename(&src_path, &dest_path).unwrap();
-            } else {
-                fs::copy(&src_path, &dest_path).unwrap();
-            }
-            copied_or_moved = true;
         }
-    }
-    if copied_or_moved {
-        println!(
-            "{} {} to {}",
-            if move_flag { "Moved" } else { "Copied" },
-            parent_folder.display(),
-            new_folder_path.display()
-        );
-    } else if skipped {
-        println!(
-            "Skipped {} to {}",
-            parent_folder.display(),
-            new_folder_path.display()
-        );
+        let cp_path = output_path.join(format!(
+            "{}/{}/{}/{}",
+            movie_folder.m_time.format("%Y"),
+            movie_folder.m_time.format("%m"),
+            movie_folder.m_time.format("%d"),
+            movie_folder.m_time.format("%Y%m%d_%H%M%S")
+        ));
+        println!("{} to {}", movie_folder, cp_path.display());
+
+        let status = Command::new("cp")
+            .arg("-rp")
+            .arg(&movie_folder.path)
+            .arg(&cp_path)
+            .status()
+            .expect("cp コマンドの実行に失敗しました。");
+
+        if !status.success() {
+            panic!("cpコマンドの実行に失敗したため終了します")
+        }
+
+        let cp_size = if let Ok(cp_size) = get_size(&cp_path) {
+            cp_size
+        } else {
+            panic!("fs_extra::dir::get_size for {}", cp_path.display());
+        };
+        if cp_size != movie_folder.size {
+            panic!("source:{}, to:{} was not eq. cp_path:{}",
+                movie_folder.size, cp_size, cp_path.display()
+            );
+        }
+        println!("ok! {} to {}", movie_folder, cp_path.display());
     }
 }
