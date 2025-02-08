@@ -126,6 +126,11 @@ fn main() {
         ));
         println!("{} to {}", movie_folder, cp_path.display());
 
+        if cp_path.exists() {
+            println!("Existed {}. Skipped.", cp_path.display());
+            continue;
+        }
+
         let status = Command::new("cp")
             .arg("-rp")
             .arg(&movie_folder.path)
